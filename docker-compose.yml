@@ -1,0 +1,146 @@
+name: streaming-pyspark-cluster
+
+# Os dados da demo ficam em .demo/, dentro do projeto (fora do git).
+x-spark: &spark
+  image: streaming-pyspark-image
+  restart: unless-stopped
+  env_file:
+    - .env.spark
+
+services:
+  spark-master:
+    <<: *spark
+    container_name: streaming-pyspark-master
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    entrypoint: ['./entrypoint.sh', 'master']
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    volumes:
+      - ./jobs:/opt/spark/apps
+      - ./.demo/spark-events:/opt/spark/spark-events
+    ports:
+      - '9091:8080'
+      - '7071:7077'
+
+  spark-history-server:
+    <<: *spark
+    container_name: streaming-pyspark-history
+    entrypoint: ['./entrypoint.sh', 'history']
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    volumes:
+      - ./.demo/spark-events:/opt/spark/spark-events
+    ports:
+      - '18081:18080'
+
+  spark-worker:
+    <<: *spark
+    scale: 2
+    entrypoint: ['./entrypoint.sh', 'worker']
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    volumes:
+      - ./jobs:/opt/spark/apps
+      - ./.demo/spark-events:/opt/spark/spark-events
+      - ./.demo/spark:/opt/spark/demo
+
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: streaming-kafka
+    hostname: kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+    volumes:
+      - ./.demo/kafka:/tmp/kraft-combined-logs
+
+  # Cria o tópico uma vez e termina.
+  kafka-init:
+    image: apache/kafka:3.9.0
+    container_name: streaming-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint:
+      - /opt/kafka/bin/kafka-topics.sh
+      - --bootstrap-server=kafka:9092
+      - --create
+      - --if-not-exists
+      - --topic=pedidos
+      - --partitions=3
+      - --replication-factor=1
+
+  produtor:
+    build: ./apps
+    image: streaming-demo-apps
+    container_name: streaming-produtor
+    restart: unless-stopped
+    command: ["python", "produtor.py"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./.demo/controle:/controle
+
+  spark-streaming:
+    <<: *spark
+    container_name: streaming-spark-streaming
+    hostname: spark-streaming
+    entrypoint: ['./entrypoint.sh', 'streaming']
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./jobs:/opt/spark/apps
+      - ./.demo/spark-events:/opt/spark/spark-events
+      - ./.demo/spark:/opt/spark/demo
+      - ./.demo/controle:/controle
+    ports:
+      - '4040:4040'
+
+  painel:
+    image: streaming-demo-apps
+    container_name: streaming-painel
+    restart: unless-stopped
+    command: ["streamlit", "run", "painel.py"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      produtor:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8501/_stcore/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    volumes:
+      - ./.demo/controle:/controle
+      - ./.demo/spark:/dados:ro
+    ports:
+      - '8501:8501'

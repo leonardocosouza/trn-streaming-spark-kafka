@@ -1,0 +1,7 @@
+*.tgz
+jobs/
+.git/
+apps/
+docs/
+.demo/
+.venv/
